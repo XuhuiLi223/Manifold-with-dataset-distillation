@@ -1,0 +1,1 @@
+python condense_hyot.py --cfg ./configs/CIFAR-10/IPC10.yaml

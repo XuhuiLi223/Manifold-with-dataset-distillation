@@ -23,6 +23,139 @@ import geoopt
 
 poincare = geoopt.PoincareBall(c=1.0)
 
+class OTProjectionHead(nn.Module):
+    def __init__(self, in_dim, proj_dim=None):
+        super().__init__()
+        self.in_dim = in_dim
+        self.proj_dim = proj_dim or in_dim
+        self.proj = nn.Sequential(
+            nn.Linear(self.in_dim, self.proj_dim),
+        )
+
+    def forward(self, x):
+        return self.proj(x)
+
+class LearnableKManifold(nn.Module):
+    """Unified constant-curvature manifold with learnable curvature k.
+    k > 0: spherical; k = 0: Euclidean; k < 0: hyperbolic (Poincaré ball model at origin).
+    Provides exp/log at the origin.
+    """
+    def __init__(self, k_init=0.0, k_max=1.0, eps=1e-6):
+        super().__init__()
+        self.raw_k = nn.Parameter(torch.tensor(float(k_init)))
+        self.k_max = float(k_max)
+        self.eps = eps
+
+    def curvature(self):
+        # Bound curvature to [-k_max, k_max] via tanh
+        return self.k_max * torch.tanh(self.raw_k)
+
+    def _safe_norm(self, v):
+        return torch.norm(v, dim=-1, keepdim=True).clamp_min(self.eps)
+
+    def exp0(self, v):
+        k = self.curvature()
+        if torch.isclose(k, torch.tensor(0.0, device=v.device), atol=1e-8):
+            return v
+        k_val = k.item() if v.numel() > 0 else 0.0
+        norm_v = self._safe_norm(v)
+        if k_val > 0:
+            s = torch.sqrt(k) * norm_v
+            scale = torch.tan(s) / s
+        else:
+            c = -k
+            s = torch.sqrt(c) * norm_v
+            scale = torch.tanh(s) / s
+        return scale * v
+
+    def log0(self, x):
+        k = self.curvature()
+        if torch.isclose(k, torch.tensor(0.0, device=x.device), atol=1e-8):
+            return x
+        k_val = k.item() if x.numel() > 0 else 0.0
+        norm_x = self._safe_norm(x)
+        if k_val > 0:
+            s = torch.sqrt(k) * norm_x
+            scale = torch.atan(s) / s
+        else:
+            c = -k
+            s = torch.sqrt(c) * norm_x
+            # artanh(s) = 0.5 * log((1+s)/(1-s))
+            scale = 0.5 * torch.log1p(2 * s / (1 - s + self.eps)) / s
+        return scale * x
+
+class MixtureManifoldEncoder(nn.Module):
+    """Three-branch encoder from Euclidean features with two learnable-curvature branches and gating in tangent space.
+    Branch 0: Euclidean (fixed k=0).
+    Branch 1/2: Learnable k via LearnableKManifold.
+    After mapping to tangent (origin), a gate fuses the three tangent vectors and is exp-mapped to a target manifold (prefer hyperbolic).
+    """
+    def __init__(self, input_dim, k1_init=-0.1, k2_init=0.1, k_max=1.0, target_k_init=-0.1):
+        super().__init__()
+        self.input_dim = input_dim
+        # Per-branch linear heads to create tangent vectors
+        self.head_euclid = nn.Linear(input_dim, input_dim)
+        self.head_k1 = nn.Linear(input_dim, input_dim)
+        self.head_k2 = nn.Linear(input_dim, input_dim)
+        # Curvature manifolds
+        self.manifold_k1 = LearnableKManifold(k_init=k1_init, k_max=k_max)
+        self.manifold_k2 = LearnableKManifold(k_init=k2_init, k_max=k_max)
+        # Target manifold (prefer hyperbolic): param ensures negative curvature via -softplus
+        self.raw_target = nn.Parameter(torch.tensor(float(target_k_init)))
+        # Simple gating on norms of tangent vectors -> softmax weights over 3 branches
+        self.gate = nn.Linear(3, 3)
+
+        # Initialize heads near identity
+        nn.init.eye_(self.head_euclid.weight)
+        nn.init.zeros_(self.head_euclid.bias)
+        nn.init.eye_(self.head_k1.weight)
+        nn.init.zeros_(self.head_k1.bias)
+        nn.init.eye_(self.head_k2.weight)
+        nn.init.zeros_(self.head_k2.bias)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+
+    def target_curvature(self):
+        # Negative softplus to bias towards hyperbolic
+        return -F.softplus(self.raw_target)
+
+    def exp0_target(self, v):
+        kT = self.target_curvature()
+        norm_v = torch.norm(v, dim=-1, keepdim=True).clamp_min(1e-6)
+        if torch.isclose(kT, torch.tensor(0.0, device=v.device), atol=1e-8):
+            return v
+        if (kT < 0).item():
+            c = -kT
+            s = torch.sqrt(c) * norm_v
+            scale = torch.tanh(s) / s
+        else:
+            s = torch.sqrt(kT) * norm_v
+            scale = torch.tan(s) / s
+        return scale * v
+
+    def forward(self, z):
+        # Tangent vectors per branch
+        v0 = self.head_euclid(z)
+        v1 = self.head_k1(z)
+        v2 = self.head_k2(z)
+        # Norm-based gating
+        norms = torch.stack([
+            torch.norm(v0, dim=-1),
+            torch.norm(v1, dim=-1),
+            torch.norm(v2, dim=-1)
+        ], dim=-1)  # [B,3]
+        w = torch.softmax(self.gate(norms), dim=-1)  # [B,3]
+        v_mix = w[:, [0]] * v0 + w[:, [1]] * v1 + w[:, [2]] * v2
+        x_mix = self.exp0_target(v_mix)
+        return {
+            'v_list': [v0, v1, v2],
+            'weights': w,
+            'v_mix': v_mix,
+            'x_mix': x_mix,
+            'k_list': [torch.tensor(0.0, device=z.device), self.manifold_k1.curvature(), self.manifold_k2.curvature()],
+            'k_target': self.target_curvature(),
+        }
+
 class Synthesizer():
     """Condensed data class
     """
@@ -393,10 +526,11 @@ def condense(args, logger, device='cuda'):
 
     # if not args.demo:
     #     synset.test(args, val_loader, logger)
-    proj_head = OTProjectionHead(4096).to(device).requires_grad_(True) # 2048 for cifar10, mnist, svhn, 4096 for product space
+    proj_head = OTProjectionHead(2048).to(device).requires_grad_(True) # 2048 for cifar10, mnist, svhn
+    mixture_encoder = MixtureManifoldEncoder(input_dim=2048).to(device)
 
     # Data distillation
-    params = list(synset.parameters()) + list(proj_head.parameters())
+    params = list(synset.parameters()) + list(proj_head.parameters()) + list(mixture_encoder.parameters())
     optim_img = torch.optim.SGD(params, lr=args.lr_img, momentum=args.mom_img)
 
     n_iter = args.niter
@@ -411,10 +545,10 @@ def condense(args, logger, device='cuda'):
     best_acc = -1
     eucli_m3d_criterion = M3DLoss(kernel_type=args.kernel)
     hyperbolic_m3d_criterion = M3DLoss(kernel_type="hyperbolic")
-    real_weighted_matrix = torch.ones((nclass, 128))
-    synthetic_weighted_matrix = torch.ones((nclass, 40))
-    real_weight_matrix = torch.nn.Parameter(real_weighted_matrix)
-    synthetic_weight_matrix = torch.nn.Parameter(synthetic_weighted_matrix)
+    # real_weighted_matrix = torch.ones((nclass, 128))
+    # synthetic_weighted_matrix = torch.ones((nclass, 40))
+    # real_weight_matrix = torch.nn.Parameter(real_weighted_matrix)
+    # synthetic_weight_matrix = torch.nn.Parameter(synthetic_weighted_matrix)
 
     for it in range(n_iter):
 
@@ -431,12 +565,7 @@ def condense(args, logger, device='cuda'):
                                      net_depth=args.depth,
                                      net_norm=args.norm_type,
                                      im_size=(args.size, args.size)).to(device)
-            hyperbolic_model = CN.CurvedConvNet(channel=args.nch,
-                                     num_classes=nclass,
-                                     net_width=width,
-                                     net_depth=args.depth,
-                                     net_norm=args.norm_type,
-                                     im_size=(args.size, args.size), curvature=-1).to(device)
+            # Single base embedder; curvature-specific behavior handled by mixture encoder
             model.train()
 
         loss_total = 0
@@ -459,41 +588,34 @@ def condense(args, logger, device='cuda'):
             syn_half = (img_aug.shape[0] - n) // 2
 
             with torch.no_grad():
-                feat_eucli_tg = eucli_model.embed(img_aug[0:n])
-                feat_hyperbolic_tg = hyperbolic_model.embed(img_aug[0:n])
-            feat_eucli = eucli_model.embed(img_aug[n:]) # [40, 2048]
-            feat_hyperbolic = hyperbolic_model.embed(img_aug[n:])
+                feat_base_tg = eucli_model.embed(img_aug[0:n])
+            feat_base = eucli_model.embed(img_aug[n:])
 
+            # Three-branch manifold encoding and tangent fusion
+            enc_tg = mixture_encoder(feat_base_tg)
+            enc_syn = mixture_encoder(feat_base)
 
-            real_weight = real_weight_matrix[c]
-            synthetic_weight = synthetic_weight_matrix[c]
-            real_weight_expanded = real_weight.unsqueeze(1).expand(-1, 2048)  # (40, 2048)
-            synthetic_weight_expanded = synthetic_weight.unsqueeze(1).expand(-1, 2048)  # (40, 2048)
-            fused_feature_tg = real_weight_expanded * feat_eucli_tg + (1 - real_weight_expanded) * feat_hyperbolic_tg
-            fused_feature = synthetic_weight_expanded * feat_eucli + (1 - synthetic_weight_expanded) * feat_hyperbolic
+            v_tg_list = enc_tg['v_list']
+            v_syn_list = enc_syn['v_list']
 
-            # feat_tg = torch.concat([feat_eucli_tg, feat_hyperbolic_tg], dim=-1) product space
-            # feat = torch.concat([feat_eucli, feat_hyperbolic], dim=-1)
+            # Per-branch OT + M3D losses in tangent (Euclidean) space
+            loss_wass_sum = 0.0
+            log_loss_sum = 0.0
+            loss_m3d_sum = 0.0
+            for i in range(3):
+                loss_wass_i, log_loss_i = wasserstein_structural_loss(
+                    proj_head(v_tg_list[i]), proj_head(v_syn_list[i]))
+                loss_m3d_i = eucli_m3d_criterion(v_syn_list[i], v_tg_list[i])
+                loss_wass_sum = loss_wass_sum + loss_wass_i
+                log_loss_sum = log_loss_sum + log_loss_i
+                loss_m3d_sum = loss_m3d_sum + loss_m3d_i
 
-            loss_wass_eucli, log_loss_eucli = wasserstein_structural_loss(proj_head(fused_feature_tg), proj_head(fused_feature)) #original euclidean space
-
-            # loss_wass_hyperbolic, log_loss_hyperbolic = wasserstein_structural_loss(
-            #     feat_hyperbolic_tg, feat_hyperbolic,
-            #     reg=0.05, lambda_log=1.0,
-            #     is_hyperbolic=True, manifold=poincare
-            # )
-            # feat = torch.concat([feat_eucli, feat_hyperbolic])
-            # feat_tg = torch.concat([feat_eucli_tg, feat_hyperbolic_tg])
-            loss_m3d_eucli = eucli_m3d_criterion(feat_eucli, feat_eucli_tg)
-            loss = loss_m3d_eucli + args.ot_weight * loss_wass_eucli
-            # print(f"loss_m3d_eucli: {loss_m3d_eucli}, loss_wass_eucli: {loss_wass_eucli}")
+            loss = loss_m3d_sum + args.ot_weight * loss_wass_sum
             loss_total += loss.item()
 
-            total_loss_m3d += loss_m3d_eucli.item()
-            total_loss_eucli += loss_wass_eucli
-            # total_loss_hyper += loss_wass_hyperbolic
-            total_log_eucli += log_loss_eucli
-            # total_log_hyperbolic += log_loss_hyperbolic
+            total_loss_m3d += loss_m3d_sum.item()
+            total_loss_eucli += loss_wass_sum
+            total_log_eucli += log_loss_sum
 
             optim_img.zero_grad()
             loss.backward()
@@ -509,8 +631,8 @@ def condense(args, logger, device='cuda'):
             "loss_m3d": avg_loss_m3d,
             "loss_wasserstein_eucli": avg_loss_eucli,
             # "loss_wasserstein_hyper": avg_loss_hyper,
-            # "avg_log_hyper": avg_log_hyper,
-            "avg_log_eucli": avg_log_eucli
+            "log_loss_eucli": avg_log_eucli,
+            # "log_loss_hyper": avg_log_hyper,
         })
 
         if args.kernel == 'gaussian':

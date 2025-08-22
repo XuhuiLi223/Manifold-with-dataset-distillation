@@ -181,108 +181,98 @@ class LearnableManifoldNetwork(nn.Module):
         }
 
 
-class ManifoldDistillationLoss(nn.Module):
-    """多流形蒸馏损失"""
+class ManifoldMatchingLoss(nn.Module):
+    """多流形匹配损失（不需要teacher model）"""
     
-    def __init__(self, temperature=4.0):
+    def __init__(self):
         super().__init__()
-        self.temperature = temperature
         
-    def compute_manifold_ot_loss(self, student_feat, teacher_feat, manifold, reg=0.1):
-        """计算流形上的OT损失"""
-        # 计算流形距离矩阵
-        if isinstance(manifold, PoincareBall):
-            # 双曲距离
-            dist_matrix = manifold.dist(
-                student_feat.unsqueeze(1), 
-                teacher_feat.unsqueeze(0)
-            )
-        elif isinstance(manifold, Sphere):
-            # 球面距离
-            dist_matrix = manifold.dist(
-                student_feat.unsqueeze(1),
-                teacher_feat.unsqueeze(0)
-            )
-        else:
-            # 欧式距离
-            dist_matrix = torch.cdist(student_feat, teacher_feat)
+    def compute_manifold_alignment_loss(self, features_dict, real_features, syn_features):
+        """计算流形对齐损失"""
+        total_loss = 0.0
+        loss_dict = {}
         
-        # 使用Sinkhorn算法计算OT
-        # 这里简化处理，实际应该使用完整的Sinkhorn迭代
-        cost_matrix = dist_matrix / dist_matrix.max()
+        # 1. 真实数据和合成数据在各个流形空间的MMD损失
+        from m3dloss import M3DLoss
         
-        # 软化的分配矩阵
-        M = torch.exp(-cost_matrix / reg)
-        M = M / M.sum(dim=1, keepdim=True)
+        # 欧式空间MMD
+        eucl_m3d = M3DLoss(kernel_type='gaussian')
+        eucl_loss = eucl_m3d(real_features['euclidean_features'], syn_features['euclidean_features'])
+        total_loss += eucl_loss
+        loss_dict['eucl_mmd'] = eucl_loss.item()
         
-        ot_loss = (M * cost_matrix).sum() / M.shape[0]
-        return ot_loss
+        # 双曲空间MMD
+        hyp_m3d = M3DLoss(kernel_type='hyperbolic')
+        hyp_loss = hyp_m3d(real_features['hyperbolic_features'], syn_features['hyperbolic_features'])
+        total_loss += hyp_loss
+        loss_dict['hyp_mmd'] = hyp_loss.item()
+        
+        # 球面空间MMD（使用高斯核近似）
+        sph_m3d = M3DLoss(kernel_type='gaussian')
+        sph_loss = sph_m3d(real_features['spherical_features'], syn_features['spherical_features'])
+        total_loss += sph_loss
+        loss_dict['sph_mmd'] = sph_loss.item()
+        
+        # 2. 融合特征的MMD损失
+        fused_m3d = M3DLoss(kernel_type='gaussian')
+        fused_loss = fused_m3d(real_features['fused_features'], syn_features['fused_features'])
+        total_loss += fused_loss * 2.0  # 融合特征更重要，权重更高
+        loss_dict['fused_mmd'] = fused_loss.item()
+        
+        return total_loss, loss_dict
     
-    def forward(self, student_output, teacher_output, student_info, teacher_info):
+    def compute_gate_consistency_loss(self, real_gates, syn_gates):
+        """计算门控一致性损失（鼓励相似的数据有相似的门控权重）"""
+        # 使用L2损失
+        gate_loss = F.mse_loss(syn_gates, real_gates.detach())
+        return gate_loss
+    
+    def compute_curvature_regularization(self, hyp_curvature, sph_curvature):
+        """曲率正则化，防止曲率过大或过小"""
+        # 鼓励曲率在合理范围内 [0.1, 5.0]
+        hyp_reg = torch.relu(0.1 - hyp_curvature) + torch.relu(hyp_curvature - 5.0)
+        sph_reg = torch.relu(0.1 - sph_curvature) + torch.relu(sph_curvature - 5.0)
+        return hyp_reg + sph_reg
+    
+    def forward(self, real_output, syn_output, real_info, syn_info):
         """
-        计算总的蒸馏损失
+        计算总的损失（不使用teacher model）
         """
         total_loss = 0.0
         loss_dict = {}
         
-        # 1. KL散度损失（logits）
-        student_logits = student_output / self.temperature
-        teacher_logits = teacher_output / self.temperature
-        kl_loss = F.kl_div(
-            F.log_softmax(student_logits, dim=-1),
-            F.softmax(teacher_logits, dim=-1),
-            reduction='batchmean'
-        ) * self.temperature ** 2
-        total_loss += kl_loss
-        loss_dict['kl_loss'] = kl_loss.item()
+        # 1. 分类损失（如果有标签）
+        if real_output is not None and syn_output is not None:
+            # 可以使用交叉熵或其他分类损失
+            pass
         
-        # 2. 各个流形空间的OT损失
-        # 欧式空间
-        eucl_ot = self.compute_manifold_ot_loss(
-            student_info['euclidean_features'],
-            teacher_info['euclidean_features'],
-            Euclidean()
+        # 2. 流形对齐损失（主要损失）
+        alignment_loss, alignment_dict = self.compute_manifold_alignment_loss(
+            {}, real_info, syn_info
         )
-        total_loss += eucl_ot * 0.1
-        loss_dict['eucl_ot'] = eucl_ot.item()
+        total_loss += alignment_loss
+        loss_dict.update(alignment_dict)
         
-        # 双曲空间
-        hyp_manifold = PoincareBall(c=student_info['hyperbolic_curvature'])
-        hyp_ot = self.compute_manifold_ot_loss(
-            student_info['hyperbolic_features'],
-            teacher_info['hyperbolic_features'],
-            hyp_manifold
+        # 3. 门控一致性损失
+        gate_loss = self.compute_gate_consistency_loss(
+            real_info['gates'], syn_info['gates']
         )
-        total_loss += hyp_ot * 0.1
-        loss_dict['hyp_ot'] = hyp_ot.item()
-        
-        # 球面空间
-        sph_manifold = Sphere()
-        sph_ot = self.compute_manifold_ot_loss(
-            student_info['spherical_features'],
-            teacher_info['spherical_features'],
-            sph_manifold
-        )
-        total_loss += sph_ot * 0.1
-        loss_dict['sph_ot'] = sph_ot.item()
-        
-        # 3. M3D损失（在融合特征上）
-        from m3dloss import M3DLoss
-        m3d_loss_fn = M3DLoss(kernel_type='gaussian')
-        m3d_loss = m3d_loss_fn(
-            student_info['fused_features'],
-            teacher_info['fused_features']
-        )
-        total_loss += m3d_loss * 0.1
-        loss_dict['m3d_loss'] = m3d_loss.item()
-        
-        # 4. 门控一致性损失（鼓励学生学习教师的流形选择）
-        gate_loss = F.mse_loss(
-            student_info['gates'],
-            teacher_info['gates']
-        )
-        total_loss += gate_loss * 0.01
+        total_loss += gate_loss * 0.1
         loss_dict['gate_loss'] = gate_loss.item()
+        
+        # 4. 曲率正则化
+        curv_reg = self.compute_curvature_regularization(
+            syn_info['hyperbolic_curvature'],
+            syn_info['spherical_curvature']
+        )
+        total_loss += curv_reg * 0.01
+        loss_dict['curvature_reg'] = curv_reg.item()
+        
+        # 5. 门控熵正则化（鼓励探索不同的流形）
+        gate_entropy = -torch.sum(syn_info['gates'] * torch.log(syn_info['gates'] + 1e-8), dim=1).mean()
+        entropy_reg = -gate_entropy  # 最大化熵
+        total_loss += entropy_reg * 0.01
+        loss_dict['entropy_reg'] = entropy_reg.item()
         
         return total_loss, loss_dict
 

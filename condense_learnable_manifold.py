@@ -19,7 +19,7 @@ from m3dloss import *
 import models.convnet as CN
 from evaluate_synset import evaluate_syn_data
 import wandb
-from learnable_manifold import LearnableManifoldNetwork, ManifoldDistillationLoss, create_learnable_manifold_model
+from learnable_manifold import LearnableManifoldNetwork, ManifoldMatchingLoss, create_learnable_manifold_model
 from geoopt.optim import RiemannianAdam
 
 
@@ -390,36 +390,34 @@ def condense(args, logger, device='cuda'):
         [synset.data.detach().cpu(), synset.targets.cpu()],
         os.path.join(args.save_dir, 'data_0.pt'))
 
-    # 创建教师模型（标准模型）
-    teacher_model = define_model(args, nclass).to(device)
-    teacher_model.train()
+    # 创建可学习流形模型
+    base_model = define_model(args, nclass).to(device)
     
     # 计算特征维度
     with torch.no_grad():
         dummy_input = torch.randn(1, nch, hs, ws).to(device)
-        dummy_features = teacher_model.embed(dummy_input)
+        dummy_features = base_model.embed(dummy_input)
         feature_dim = dummy_features.shape[1]
     
-    # 创建学生模型（可学习流形模型）
-    base_student_model = define_model(args, nclass).to(device)
-    student_model = create_learnable_manifold_model(
-        base_model=base_student_model,
+    # 创建可学习流形网络
+    model = create_learnable_manifold_model(
+        base_model=base_model,
         input_dim=feature_dim,
         num_classes=nclass
     ).to(device)
     
     # 定义损失函数
-    distill_criterion = ManifoldDistillationLoss(temperature=args.temperature)
+    criterion = ManifoldMatchingLoss()
     
-    # 数据蒸馏优化器
-    # 包含：合成数据、学生模型参数（包括流形投影参数）
+    # 数据优化器
+    # 包含：合成数据、模型参数（包括流形投影参数）
     params = list(synset.parameters())
     
-    # 学生模型参数
+    # 模型参数
     euclidean_params = []
     manifold_params = []
     
-    for name, param in student_model.named_parameters():
+    for name, param in model.named_parameters():
         if 'proj' in name or 'gate' in name:
             manifold_params.append(param)
         else:
@@ -434,7 +432,6 @@ def condense(args, logger, device='cuda'):
 
     n_iter = args.niter
     it_log = 20
-    warmup_epoch = 200
 
     it_test = np.arange(0, n_iter + 1, args.test_it_interval).tolist()
 
@@ -446,15 +443,13 @@ def condense(args, logger, device='cuda'):
         
         # 每隔一定步数重新初始化模型
         if it % args.ipm == 0:
-            teacher_model = define_model(args, nclass).to(device)
-            teacher_model.train()
-            
-            base_student_model = define_model(args, nclass).to(device)
-            student_model = create_learnable_manifold_model(
-                base_model=base_student_model,
+            base_model = define_model(args, nclass).to(device)
+            model = create_learnable_manifold_model(
+                base_model=base_model,
                 input_dim=feature_dim,
                 num_classes=nclass
             ).to(device)
+            model.train()
 
         loss_total = 0
         synset.data.data = torch.clamp(synset.data.data, min=0., max=1.)
@@ -462,12 +457,13 @@ def condense(args, logger, device='cuda'):
         # Update synset
         total_losses = {
             'total': 0.0,
-            'kl': 0.0,
-            'eucl_ot': 0.0,
-            'hyp_ot': 0.0,
-            'sph_ot': 0.0,
-            'm3d': 0.0,
-            'gate': 0.0
+            'eucl_mmd': 0.0,
+            'hyp_mmd': 0.0,
+            'sph_mmd': 0.0,
+            'fused_mmd': 0.0,
+            'gate_loss': 0.0,
+            'curvature_reg': 0.0,
+            'entropy_reg': 0.0
         }
 
         for c in range(nclass):
@@ -477,27 +473,16 @@ def condense(args, logger, device='cuda'):
             n = img_real.shape[0]
             img_aug = aug(torch.cat([img_real, img_syn]))
 
-            # 教师模型输出
-            with torch.no_grad():
-                teacher_out = teacher_model(img_aug[:n])
-                teacher_features = teacher_model.embed(img_aug[:n])
-                teacher_info = {
-                    'euclidean_features': teacher_features,
-                    'hyperbolic_features': teacher_features,  # 教师模型只有欧式特征
-                    'spherical_features': teacher_features,
-                    'fused_features': teacher_features,
-                    'gates': torch.tensor([1.0, 0.0, 0.0]).unsqueeze(0).repeat(n, 1).to(device),
-                    'hyperbolic_curvature': torch.tensor(1.0).to(device),
-                    'spherical_curvature': torch.tensor(1.0).to(device)
-                }
+            # 真实数据特征
+            _, real_info = model(img_aug[:n])
             
-            # 学生模型输出
-            student_out, student_info = student_model(img_aug[n:])
+            # 合成数据特征
+            _, syn_info = model(img_aug[n:])
             
-            # 计算蒸馏损失
-            loss, loss_dict = distill_criterion(
-                student_out, teacher_out,
-                student_info, teacher_info
+            # 计算损失
+            loss, loss_dict = criterion(
+                None, None,  # 不使用logits
+                real_info, syn_info
             )
             
             loss_total += loss.item()
@@ -518,23 +503,24 @@ def condense(args, logger, device='cuda'):
         # 记录到wandb
         wandb.log({
             "iteration": it,
-            "loss/total": total_losses['total'],
-            "loss/kl": total_losses['kl'],
-            "loss/eucl_ot": total_losses['eucl_ot'],
-            "loss/hyp_ot": total_losses['hyp_ot'],
-            "loss/sph_ot": total_losses['sph_ot'],
-            "loss/m3d": total_losses['m3d'],
-            "loss/gate": total_losses['gate'],
-            "curvature/hyperbolic": student_model.hyperbolic_proj.curvature.item(),
-            "curvature/spherical": student_model.spherical_proj.curvature.item()
+            "loss/total": loss_total / nclass,
+            "loss/eucl_mmd": total_losses['eucl_mmd'],
+            "loss/hyp_mmd": total_losses['hyp_mmd'],
+            "loss/sph_mmd": total_losses['sph_mmd'],
+            "loss/fused_mmd": total_losses['fused_mmd'],
+            "loss/gate": total_losses['gate_loss'],
+            "loss/curvature_reg": total_losses['curvature_reg'],
+            "loss/entropy_reg": total_losses['entropy_reg'],
+            "curvature/hyperbolic": model.hyperbolic_proj.curvature.item(),
+            "curvature/spherical": model.spherical_proj.curvature.item()
         })
 
         # Logging
         if it % it_log == 0:
             logger(
                 f"{utils.get_time()} (Iter {it:3d}) loss: {loss_total / nclass:.4f}, "
-                f"hyp_c: {student_model.hyperbolic_proj.curvature.item():.3f}, "
-                f"sph_c: {student_model.spherical_proj.curvature.item():.3f}"
+                f"hyp_c: {model.hyperbolic_proj.curvature.item():.3f}, "
+                f"sph_c: {model.spherical_proj.curvature.item():.3f}"
             )
 
         if (it + 1) in it_test:
@@ -549,8 +535,8 @@ def condense(args, logger, device='cuda'):
             
             # 保存学到的曲率参数
             torch.save({
-                'hyperbolic_curvature': student_model.hyperbolic_proj.curvature.item(),
-                'spherical_curvature': student_model.spherical_proj.curvature.item(),
+                'hyperbolic_curvature': model.hyperbolic_proj.curvature.item(),
+                'spherical_curvature': model.spherical_proj.curvature.item(),
                 'iteration': it + 1
             }, os.path.join(args.save_dir, f'curvatures_{it + 1}.pt'))
             
@@ -564,8 +550,8 @@ def condense(args, logger, device='cuda'):
                         [synset.data.detach().cpu(), synset.targets.cpu()],
                         os.path.join(args.save_dir, 'data_best.pt'))
                     torch.save({
-                        'hyperbolic_curvature': student_model.hyperbolic_proj.curvature.item(),
-                        'spherical_curvature': student_model.spherical_proj.curvature.item(),
+                        'hyperbolic_curvature': model.hyperbolic_proj.curvature.item(),
+                        'spherical_curvature': model.spherical_proj.curvature.item(),
                         'iteration': it + 1
                     }, os.path.join(args.save_dir, 'curvatures_best.pt'))
 
@@ -584,8 +570,6 @@ if __name__ == '__main__':
     parser.add_argument("--cfg", type=str, default="")
     parser.add_argument("--pretrain_dir", type=str, default="checkpoints")
     parser.add_argument("--demo", action='store_true', help='for debugging, do not save results')
-    parser.add_argument("--softlabel", default=False, dest="softlabel", help="Use the softlabel to evaluate the dataset")
-    parser.add_argument("--temperature", type=float, default=4.0, help="The temperature for KLdiv")
     parser.add_argument("--lr_net", type=float, default=0.01, help="learning rate for network parameters")
 
     args = parser.parse_args()
@@ -599,7 +583,7 @@ if __name__ == '__main__':
     mode = "online"
     wandb.init(
         project=f'LearnableManifold_{args.dataset}',
-        name=f'Model_{args.net_type}_Method_learnable_manifold_condensation',
+        name=f'Model_{args.net_type}_Method_learnable_manifold_condensation_no_teacher',
         mode=mode,
     )
 

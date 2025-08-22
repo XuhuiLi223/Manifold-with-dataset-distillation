@@ -8,7 +8,7 @@ from learnable_manifold import (
     LearnableManifoldProjection, 
     GatedManifoldFusion,
     LearnableManifoldNetwork,
-    ManifoldDistillationLoss
+    ManifoldMatchingLoss
 )
 import models.convnet as CN
 
@@ -117,23 +117,29 @@ def test_learnable_manifold_network():
     print("✓ LearnableManifoldNetwork test passed!\n")
 
 
-def test_distillation_loss():
-    """测试蒸馏损失函数"""
-    print("Testing ManifoldDistillationLoss...")
+def test_manifold_matching_loss():
+    """测试流形匹配损失函数（无teacher）"""
+    print("Testing ManifoldMatchingLoss...")
     
     batch_size = 8
     num_classes = 10
     feature_dim = 128
     
     # 创建损失函数
-    loss_fn = ManifoldDistillationLoss(temperature=4.0)
+    loss_fn = ManifoldMatchingLoss()
     
-    # 模拟学生和教师输出
-    student_logits = torch.randn(batch_size, num_classes)
-    teacher_logits = torch.randn(batch_size, num_classes)
+    # 模拟真实数据和合成数据的特征
+    real_info = {
+        'euclidean_features': torch.randn(batch_size, feature_dim),
+        'hyperbolic_features': torch.randn(batch_size, feature_dim),
+        'spherical_features': torch.randn(batch_size, feature_dim),
+        'fused_features': torch.randn(batch_size, feature_dim),
+        'gates': torch.softmax(torch.randn(batch_size, 3), dim=-1),
+        'hyperbolic_curvature': torch.tensor(1.2),
+        'spherical_curvature': torch.tensor(0.9)
+    }
     
-    # 模拟特征信息
-    student_info = {
+    syn_info = {
         'euclidean_features': torch.randn(batch_size, feature_dim),
         'hyperbolic_features': torch.randn(batch_size, feature_dim),
         'spherical_features': torch.randn(batch_size, feature_dim),
@@ -143,20 +149,10 @@ def test_distillation_loss():
         'spherical_curvature': torch.tensor(0.8)
     }
     
-    teacher_info = {
-        'euclidean_features': torch.randn(batch_size, feature_dim),
-        'hyperbolic_features': torch.randn(batch_size, feature_dim),
-        'spherical_features': torch.randn(batch_size, feature_dim),
-        'fused_features': torch.randn(batch_size, feature_dim),
-        'gates': torch.tensor([1.0, 0.0, 0.0]).unsqueeze(0).repeat(batch_size, 1),
-        'hyperbolic_curvature': torch.tensor(1.0),
-        'spherical_curvature': torch.tensor(1.0)
-    }
-    
     # 计算损失
     total_loss, loss_dict = loss_fn(
-        student_logits, teacher_logits,
-        student_info, teacher_info
+        None, None,  # 不使用logits
+        real_info, syn_info
     )
     
     print(f"Total loss: {total_loss.item():.4f}")
@@ -164,7 +160,7 @@ def test_distillation_loss():
     for key, value in loss_dict.items():
         print(f"  {key}: {value:.4f}")
     
-    print("✓ ManifoldDistillationLoss test passed!\n")
+    print("✓ ManifoldMatchingLoss test passed!\n")
 
 
 def test_gradient_flow():
@@ -200,9 +196,40 @@ def test_gradient_flow():
     print("✓ Gradient flow test passed!\n")
 
 
+def test_mmd_computation():
+    """测试MMD损失计算"""
+    print("Testing MMD computation...")
+    
+    from m3dloss import M3DLoss
+    
+    batch_size = 16
+    feature_dim = 64
+    
+    # 创建不同的核函数
+    gaussian_mmd = M3DLoss(kernel_type='gaussian')
+    hyperbolic_mmd = M3DLoss(kernel_type='hyperbolic')
+    
+    # 生成测试数据
+    real_features = torch.randn(batch_size, feature_dim)
+    syn_features = torch.randn(batch_size, feature_dim)
+    
+    # 计算MMD
+    gaussian_loss = gaussian_mmd(real_features, syn_features)
+    hyperbolic_loss = hyperbolic_mmd(real_features, syn_features)
+    
+    print(f"Gaussian MMD loss: {gaussian_loss.item():.6f}")
+    print(f"Hyperbolic MMD loss: {hyperbolic_loss.item():.6f}")
+    
+    # 测试相同分布的MMD（应该接近0）
+    same_loss = gaussian_mmd(real_features, real_features)
+    print(f"Same distribution MMD: {same_loss.item():.8f} (should be close to 0)")
+    
+    print("✓ MMD computation test passed!\n")
+
+
 if __name__ == "__main__":
     print("=" * 50)
-    print("Testing Learnable Manifold Components")
+    print("Testing Learnable Manifold Components (No Teacher)")
     print("=" * 50)
     
     # 设置随机种子
@@ -212,8 +239,9 @@ if __name__ == "__main__":
     test_learnable_manifold_projection()
     test_gated_fusion()
     test_learnable_manifold_network()
-    test_distillation_loss()
+    test_manifold_matching_loss()
     test_gradient_flow()
+    test_mmd_computation()
     
     print("=" * 50)
     print("All tests passed! ✓")

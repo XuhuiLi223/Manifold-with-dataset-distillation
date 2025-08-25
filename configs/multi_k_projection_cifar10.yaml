@@ -1,0 +1,47 @@
+# Multi-K Projection Configuration for CIFAR-10
+
+# Dataset settings
+dataset: cifar10
+data_dir: ./data
+nclass: 10
+
+# Model settings
+net_type: convnet
+depth: 3
+width: 128
+
+# Multi-K Projection settings
+num_spaces: 10  # 使用10个投影空间
+
+# Condensation settings
+ipc: 10  # images per class
+factor: 2
+decode_type: bound
+batch_real: 256
+batch_syn_max: 128
+
+# Training settings
+niter: 5000
+test_it_interval: 500
+lr_img: 1.0
+lr_net: 0.01
+mom_img: 0.5
+ipm: 500  # iterations per model re-init
+
+# Augmentation
+aug_type: color_crop_cutout
+augment: True
+rrc: False
+
+# System settings
+workers: 4
+batch_size: 256
+seed: 42
+dseed: 42
+
+# Paths
+results_path: ./results
+load_memory: False
+
+# Initialization
+init: mix

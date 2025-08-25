@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import geoopt
-from geoopt.manifolds import PoincareBall, Sphere, Euclidean, ProductManifold
+from geoopt.manifolds import PoincareBall, Sphere, Euclidean
 from geoopt.optim import RiemannianAdam
 import numpy as np
 from typing import List, Tuple, Dict, Optional
@@ -125,7 +125,8 @@ class MultiSpaceProjection(nn.Module):
             
             # 加权组合
             x = weight * hyp_x + (1 - weight) * sph_x
-            manifold = ProductManifold((hyp_manifold, sph_manifold))
+            # 混合流形使用欧式空间作为代理，因为我们已经在欧式空间中组合了特征
+            manifold = Euclidean()
             
         else:
             raise ValueError(f"Unknown manifold type: {self.manifold_type}")
